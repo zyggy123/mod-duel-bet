@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://github.com/zyggy123/mod-duel-bet/blob/main/icon.png" width="200" />
+</p>
+
 # mod-duel-bet ⚔️💰
 
 A lightweight Lua module for **AzerothCore 3.3.5a** that allows players to wager gold on the outcome of their duels. 
