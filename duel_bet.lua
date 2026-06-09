@@ -1,14 +1,12 @@
 --[[
     Duel Bet Module for AzerothCore 3.3.5a (Eluna) Zyggy123 (https://github.com/zyggy123/mod-duel-bet)
-    Fix: Removed 'menu_id' to support all Eluna versions + Forced Mail on Logout.
+    Optimized: DB Escrow, Mail Refund System, No Memory Leaks, Gossip Crash Fix.
 ]]
 
 local MIN_BET_GOLD = 1
 local MAX_BET_GOLD = 100000
 local COOLDOWN_SECONDS = 10
 local MENU_ID = 55555
-
-local cooldowns = {}
 
 local function ToCopper(gold)
     return gold * 10000
@@ -20,7 +18,7 @@ local function SendMsg(player, msg)
     end
 end
 
--- The function through which we return the money. If the player leaves the game, he is guaranteed to receive it via Mailbox.
+-- The function through which we return the money. If the player leaves the game, they are guaranteed to receive it via Mailbox.
 local function SafeRefund(guidLow, copperAmount, reason, forceMail)
     local player = GetPlayerByGUID(guidLow)
     
@@ -102,8 +100,11 @@ local function OnDuelBetCommand(event, player, command)
     
     -- INITIATE BET
     local playerName = player:GetName()
-    if cooldowns[playerName] and cooldowns[playerName] > os.time() then
-        SendMsg(player, "Please wait " .. (cooldowns[playerName] - os.time()) .. " seconds before sending another bet challenge.")
+    
+    -- We use GetData for Cooldown 
+    local playerCooldown = player:GetData("DuelBetCooldown")
+    if playerCooldown and playerCooldown > os.time() then
+        SendMsg(player, "Please wait " .. (playerCooldown - os.time()) .. " seconds before sending another bet challenge.")
         return false
     end
     
@@ -140,7 +141,8 @@ local function OnDuelBetCommand(event, player, command)
         return false
     end
     
-    cooldowns[playerName] = os.time() + COOLDOWN_SECONDS
+    --We set the clean Cooldown on the C++ player
+    player:SetData("DuelBetCooldown", os.time() + COOLDOWN_SECONDS)
     
     player:ModifyMoney(-copperAmount)
     CharDBExecute("INSERT INTO duel_bets (player1_guid, player2_guid, amount, status) VALUES (" .. pGuid .. ", " .. tGuid .. ", " .. copperAmount .. ", 0)")
@@ -157,7 +159,7 @@ local function OnDuelBetCommand(event, player, command)
 end
 
 -- ==========================================
--- 2. GOSSIP SELECT 
+-- 2. GOSSIP SELECT
 -- ==========================================
 local function OnGossipSelect(event, player, object, sender, intid, code)
     local tGuid = player:GetGUIDLow()
@@ -256,7 +258,7 @@ local function OnDuelEnd(event, winner, loser, type)
 end
 
 -- ==========================================
--- 5. LOGOUT/CRASH RECOVERY 
+-- 5. LOGOUT/CRASH RECOVERY (Forced Mail)
 -- ==========================================
 local function OnPlayerLogout(event, player)
     local guid = player:GetGUIDLow()
@@ -273,7 +275,6 @@ local function OnPlayerLogout(event, player)
             CharDBExecute("DELETE FROM duel_bets WHERE id = " .. betId)
 
             if status == 0 then
-                -- true = We force return by mail for the one who leaves
                 SafeRefund(p1, amount, "player logged out", (p1 == guid))
             elseif status >= 1 then
                 SafeRefund(p1, amount, "player logged out (abandoned)", (p1 == guid))
@@ -283,6 +284,7 @@ local function OnPlayerLogout(event, player)
     end
 end
 
+-- Event Registrations
 RegisterPlayerEvent(42, OnDuelBetCommand)
 RegisterPlayerEvent(10, OnDuelStart)
 RegisterPlayerEvent(11, OnDuelEnd)
