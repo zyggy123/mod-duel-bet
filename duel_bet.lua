@@ -1,6 +1,6 @@
 --[[
-    Duel Bet Module for AzerothCore 3.3.5a (Eluna)
-    Allows players to bet gold on the outcome of a duel.
+    Duel Bet Module for AzerothCore 3.3.5a (Eluna) Zyggy123 (https://github.com/zyggy123/mod-duel-bet)
+    Fix: Removed 'menu_id' to support all Eluna versions + Forced Mail on Logout.
 ]]
 
 local MIN_BET_GOLD = 1
@@ -8,8 +8,6 @@ local MAX_BET_GOLD = 100000
 local COOLDOWN_SECONDS = 10
 local MENU_ID = 55555
 
-local pendingBets = {}
-local activeBets = {}
 local cooldowns = {}
 
 local function ToCopper(gold)
@@ -17,12 +15,34 @@ local function ToCopper(gold)
 end
 
 local function SendMsg(player, msg)
-    player:SendBroadcastMessage("|cff00ccff[Duel Bet]|r " .. msg)
+    if player then
+        player:SendBroadcastMessage("|cff00ccff[Duel Bet]|r " .. msg)
+    end
 end
 
--- Command Hook
+-- The function through which we return the money. If the player leaves the game, he is guaranteed to receive it via Mailbox.
+local function SafeRefund(guidLow, copperAmount, reason, forceMail)
+    local player = GetPlayerByGUID(guidLow)
+    
+    if player and player:IsInWorld() and not forceMail then
+        player:ModifyMoney(copperAmount)
+        SendMsg(player, "The bet was cancelled (" .. reason .. "). Your " .. (copperAmount/10000) .. " gold was refunded.")
+    else
+        local subject = "Duel Bet Refund"
+        local body = "Your duel bet was cancelled: " .. reason .. ". Your " .. (copperAmount/10000) .. " gold has been safely refunded."
+        SendMail("DuelBet System", body, guidLow, 0, 61, 0, copperAmount)
+        
+        if player then
+            SendMsg(player, "The bet was cancelled. Since you are logging out, the gold was sent to your Mailbox.")
+        end
+    end
+end
+
+-- ==========================================
+-- 1. COMAND .duelbet
+-- ==========================================
 local function OnDuelBetCommand(event, player, command)
-    if not player then return end -- ignore console
+    if not player then return end 
     
     local cmd, arg = command:match("^(%S+)%s*(.*)")
     if not cmd then cmd = command end
@@ -32,49 +52,56 @@ local function OnDuelBetCommand(event, player, command)
         return
     end
     
-    local playerName = player:GetName()
+    local pGuid = player:GetGUIDLow()
     
+    -- STATS
+    if arg == "stats" then
+        local q = CharDBQuery("SELECT total_duels, total_won, total_profit FROM duel_bet_stats WHERE guid = " .. pGuid)
+        if q then
+            SendMsg(player, "Stats -> Matches: " .. q:GetUInt32(0) .. " | Wins: " .. q:GetUInt32(1) .. " | Net Profit: " .. (q:GetInt32(2) / 10000) .. " Gold")
+        else
+            SendMsg(player, "You haven't played any money duels yet.")
+        end
+        return false
+    end
+
+    -- CANCEL
     if arg == "cancel" then
-        if pendingBets[playerName] then
-            local pTarget = GetPlayerByName(pendingBets[playerName].target)
-            if pTarget then
-                SendMsg(pTarget, playerName .. " has cancelled their pending duel bet.")
-                pTarget:GossipComplete() -- Close gossip if it's open
-            end
-            SendMsg(player, "You cancelled your pending duel bet.")
-            pendingBets[playerName] = nil
-        end
-        
-        if activeBets[playerName] and not activeBets[playerName].inDuel then
-            local betInfo = activeBets[playerName]
-            local opponentName = betInfo.opponent
-            local amount = betInfo.amount
-            
-            local opponent = GetPlayerByName(opponentName)
-            player:ModifyMoney(ToCopper(amount))
-            if opponent then
-                opponent:ModifyMoney(ToCopper(amount))
-                SendMsg(opponent, playerName .. " has cancelled the active duel bet. Your " .. amount .. " gold has been refunded.")
-            else
-                -- If offline, use DB
-                local accountId = GetAccountIdByName(opponentName)
-                if accountId then
-                    CharDBExecute("UPDATE characters SET money = money + " .. ToCopper(amount) .. " WHERE name = '" .. opponentName .. "'")
-                end
-            end
-            SendMsg(player, "You cancelled the active duel bet. Your " .. amount .. " gold has been refunded.")
-            
-            activeBets[playerName] = nil
-            activeBets[opponentName] = nil
-        elseif activeBets[playerName] and activeBets[playerName].inDuel then
-            SendMsg(player, "You cannot cancel a bet while a duel is in progress!")
-        elseif not pendingBets[playerName] and not activeBets[playerName] then
+        local q = CharDBQuery("SELECT id, player1_guid, player2_guid, amount, status FROM duel_bets WHERE player1_guid = " .. pGuid .. " OR player2_guid = " .. pGuid)
+        if not q then
             SendMsg(player, "No active or pending bet to cancel.")
+            return false
         end
-        return false -- block normal command execution
+
+        local betId = q:GetUInt32(0)
+        local p1 = q:GetUInt32(1)
+        local p2 = q:GetUInt32(2)
+        local amt = q:GetUInt32(3)
+        local status = q:GetUInt8(4)
+
+        if status == 2 then
+            SendMsg(player, "You cannot cancel a bet while a duel is in progress!")
+            return false
+        end
+
+        CharDBExecute("DELETE FROM duel_bets WHERE id = " .. betId)
+
+        if status == 0 then
+            SafeRefund(p1, amt, "cancelled by challenger", false)
+            local targetPlayer = GetPlayerByGUID(p2)
+            if targetPlayer then 
+                targetPlayer:GossipComplete() 
+                SendMsg(targetPlayer, "The pending duel bet was cancelled.")
+            end
+        elseif status == 1 then
+            SafeRefund(p1, amt, "cancelled manually", false)
+            SafeRefund(p2, amt, "cancelled manually", false)
+        end
+        return false
     end
     
-    -- Check cooldown for sending challenges
+    -- INITIATE BET
+    local playerName = player:GetName()
     if cooldowns[playerName] and cooldowns[playerName] > os.time() then
         SendMsg(player, "Please wait " .. (cooldowns[playerName] - os.time()) .. " seconds before sending another bet challenge.")
         return false
@@ -82,7 +109,7 @@ local function OnDuelBetCommand(event, player, command)
     
     local amount = tonumber(arg)
     if not amount or amount < MIN_BET_GOLD or amount > MAX_BET_GOLD then
-        SendMsg(player, "Usage: .duelbet <amount> (or .duelbet cancel)")
+        SendMsg(player, "Usage: .duelbet <amount> (or .duelbet cancel / stats)")
         SendMsg(player, "Amount must be between " .. MIN_BET_GOLD .. " and " .. MAX_BET_GOLD .. " gold.")
         return false
     end
@@ -94,13 +121,11 @@ local function OnDuelBetCommand(event, player, command)
     end
     
     local targetName = target:GetName()
+    local tGuid = target:GetGUIDLow()
     
-    if activeBets[playerName] then
-        SendMsg(player, "You already have an active bet! Type .duelbet cancel to remove it.")
-        return false
-    end
-    if activeBets[targetName] then
-        SendMsg(player, "That player already has an active bet.")
+    local qCheck = CharDBQuery("SELECT id FROM duel_bets WHERE player1_guid = " .. pGuid .. " OR player2_guid = " .. pGuid .. " OR player1_guid = " .. tGuid .. " OR player2_guid = " .. tGuid)
+    if qCheck then
+        SendMsg(player, "One of you already has an active or pending bet! Type .duelbet cancel to remove it.")
         return false
     end
     
@@ -115,17 +140,14 @@ local function OnDuelBetCommand(event, player, command)
         return false
     end
     
-    -- Update cooldown
     cooldowns[playerName] = os.time() + COOLDOWN_SECONDS
     
-    -- Set pending bet
-    pendingBets[playerName] = { target = targetName, amount = amount }
+    player:ModifyMoney(-copperAmount)
+    CharDBExecute("INSERT INTO duel_bets (player1_guid, player2_guid, amount, status) VALUES (" .. pGuid .. ", " .. tGuid .. ", " .. copperAmount .. ", 0)")
     
     SendMsg(player, "You have challenged " .. targetName .. " to a duel bet for " .. amount .. " gold.")
     SendMsg(target, playerName .. " has challenged you to a duel bet for " .. amount .. " gold!")
     
-    -- Open Gossip Menu on the target
-    -- We pass 'target' as the object to GossipSendMenu so the client allows the interaction
     target:GossipClearMenu()
     target:GossipMenuAddItem(0, "Accept Duel Bet (" .. amount .. " gold)", 0, 1, false, "Are you sure you want to accept the bet and lock in " .. amount .. " gold?")
     target:GossipMenuAddItem(0, "Decline", 0, 2)
@@ -134,144 +156,130 @@ local function OnDuelBetCommand(event, player, command)
     return false
 end
 
--- Gossip Select Hook
-local function OnGossipSelect(event, player, object, sender, intid, code, menu_id)
-    local targetName = player:GetName()
-    local challengerName = nil
+-- ==========================================
+-- 2. GOSSIP SELECT 
+-- ==========================================
+local function OnGossipSelect(event, player, object, sender, intid, code)
+    local tGuid = player:GetGUIDLow()
+
+    local q = CharDBQuery("SELECT id, player1_guid, amount FROM duel_bets WHERE player2_guid = " .. tGuid .. " AND status = 0")
     
-    -- Find who challenged this player
-    for cName, bet in pairs(pendingBets) do
-        if bet.target == targetName then
-            challengerName = cName
-            break
-        end
-    end
-    
-    if not challengerName then
+    if not q then
         SendMsg(player, "This bet challenge has expired or is invalid.")
         player:GossipComplete()
         return
     end
-    
-    local challenger = GetPlayerByName(challengerName)
-    if not challenger then
-        SendMsg(player, "The challenger is no longer online.")
-        pendingBets[challengerName] = nil
-        player:GossipComplete()
-        return
-    end
-    
-    if intid == 2 then -- Decline
+
+    local betId = q:GetUInt32(0)
+    local pGuid = q:GetUInt32(1)
+    local copperAmount = q:GetUInt32(2)
+
+    if intid == 2 then -- DECLINE
+        CharDBExecute("DELETE FROM duel_bets WHERE id = " .. betId)
+        SafeRefund(pGuid, copperAmount, "declined by opponent", false)
         SendMsg(player, "You declined the duel bet.")
-        SendMsg(challenger, targetName .. " has declined your duel bet.")
-        pendingBets[challengerName] = nil
         player:GossipComplete()
         return
     end
     
-    if intid == 1 then -- Accept
-        local amount = pendingBets[challengerName].amount
-        local copperAmount = ToCopper(amount)
-        
+    if intid == 1 then -- ACCEPT
         if player:GetCoinage() < copperAmount then
             SendMsg(player, "You don't have enough gold to accept.")
-            SendMsg(challenger, targetName .. " doesn't have enough gold to accept.")
-            pendingBets[challengerName] = nil
+            CharDBExecute("DELETE FROM duel_bets WHERE id = " .. betId)
+            SafeRefund(pGuid, copperAmount, "opponent didn't have enough gold", false)
             player:GossipComplete()
             return
         end
         
-        if challenger:GetCoinage() < copperAmount then
-            SendMsg(player, challengerName .. " no longer has enough gold.")
-            SendMsg(challenger, "You no longer have enough gold for the bet.")
-            pendingBets[challengerName] = nil
-            player:GossipComplete()
-            return
-        end
-        
-        if activeBets[targetName] or activeBets[challengerName] then
-            SendMsg(player, "One of you already has an active bet.")
-            SendMsg(challenger, "One of you already has an active bet.")
-            player:GossipComplete()
-            return
-        end
-        
-        -- Deduct money
         player:ModifyMoney(-copperAmount)
-        challenger:ModifyMoney(-copperAmount)
+        CharDBExecute("UPDATE duel_bets SET status = 1 WHERE id = " .. betId)
         
-        activeBets[challengerName] = { opponent = targetName, amount = amount, inDuel = false }
-        activeBets[targetName] = { opponent = challengerName, amount = amount, inDuel = false }
+        SendMsg(player, "Duel bet accepted! Both players locked in " .. (copperAmount/10000) .. " gold. Start the duel!")
         
-        pendingBets[challengerName] = nil
-        
-        SendMsg(player, "Duel bet accepted! You and " .. challengerName .. " have both put in " .. amount .. " gold. The winner takes it all!")
-        SendMsg(challenger, "Duel bet accepted! You and " .. targetName .. " have both put in " .. amount .. " gold. The winner takes it all!")
+        local challenger = GetPlayerByGUID(pGuid)
+        if challenger then
+            SendMsg(challenger, "Duel bet accepted! Both players locked in " .. (copperAmount/10000) .. " gold. Start the duel!")
+        end
         player:GossipComplete()
     end
 end
 
+-- ==========================================
+-- 3. BEGINNING OF THE DUEL
+-- ==========================================
 local function OnDuelStart(event, player1, player2)
-    local name1 = player1:GetName()
-    local name2 = player2:GetName()
+    local guid1 = player1:GetGUIDLow()
+    local guid2 = player2:GetGUIDLow()
+
+    local q = CharDBQuery("SELECT id, amount FROM duel_bets WHERE status = 1 AND ((player1_guid = " .. guid1 .. " AND player2_guid = " .. guid2 .. ") OR (player1_guid = " .. guid2 .. " AND player2_guid = " .. guid1 .. "))")
     
-    if activeBets[name1] and activeBets[name1].opponent == name2 then
-        activeBets[name1].inDuel = true
-        activeBets[name2].inDuel = true
-        SendMsg(player1, "The duel has started! Your bet of " .. activeBets[name1].amount .. " gold is locked in.")
-        SendMsg(player2, "The duel has started! Your bet of " .. activeBets[name2].amount .. " gold is locked in.")
+    if q then
+        local betId = q:GetUInt32(0)
+        CharDBExecute("UPDATE duel_bets SET status = 2 WHERE id = " .. betId)
+        
+        local amountGold = q:GetUInt32(1) / 10000
+        SendMsg(player1, "The duel has started! Your bet of " .. amountGold .. " gold is locked in.")
+        SendMsg(player2, "The duel has started! Your bet of " .. amountGold .. " gold is locked in.")
     end
 end
 
+-- ==========================================
+-- 4. DUEL COMPLETION
+-- ==========================================
 local function OnDuelEnd(event, winner, loser, type)
     if not winner or not loser then return end
     
-    local winnerName = winner:GetName()
-    local loserName = loser:GetName()
+    local wGuid = winner:GetGUIDLow()
+    local lGuid = loser:GetGUIDLow()
+
+    local q = CharDBQuery("SELECT id, amount FROM duel_bets WHERE status = 2 AND ((player1_guid = " .. wGuid .. " AND player2_guid = " .. lGuid .. ") OR (player1_guid = " .. lGuid .. " AND player2_guid = " .. wGuid .. "))")
     
-    if activeBets[winnerName] and activeBets[winnerName].opponent == loserName then
-        local amount = activeBets[winnerName].amount
-        local totalPrize = ToCopper(amount * 2)
+    if q then
+        local betId = q:GetUInt32(0)
+        local amountCopper = q:GetUInt32(1)
+        local totalPrize = amountCopper * 2
         
-        if type == 1 then -- 1 is DUEL_WON, 0 is DUEL_INTERRUPTED, 2 is DUEL_FLED
+        CharDBExecute("DELETE FROM duel_bets WHERE id = " .. betId)
+
+        if type == 1 then -- DUEL_WON
             winner:ModifyMoney(totalPrize)
-            SendMsg(winner, "You won the duel! You receive " .. (amount * 2) .. " gold.")
-            SendMsg(loser, "You lost the duel bet and " .. amount .. " gold.")
+            SendMsg(winner, "You won the duel! You receive " .. (totalPrize/10000) .. " gold.")
+            SendMsg(loser, "You lost the duel bet and " .. (amountCopper/10000) .. " gold.")
+
+            CharDBExecute("INSERT INTO duel_bet_stats (guid, total_duels, total_won, total_profit) VALUES (" .. wGuid .. ", 1, 1, " .. amountCopper .. ") ON DUPLICATE KEY UPDATE total_duels = total_duels + 1, total_won = total_won + 1, total_profit = total_profit + " .. amountCopper)
+            CharDBExecute("INSERT INTO duel_bet_stats (guid, total_duels, total_won, total_profit) VALUES (" .. lGuid .. ", 1, 0, -" .. amountCopper .. ") ON DUPLICATE KEY UPDATE total_duels = total_duels + 1, total_profit = total_profit - " .. amountCopper)
         else
-            winner:ModifyMoney(ToCopper(amount))
-            loser:ModifyMoney(ToCopper(amount))
-            SendMsg(winner, "The duel was interrupted! Your bet of " .. amount .. " gold has been refunded.")
-            SendMsg(loser, "The duel was interrupted! Your bet of " .. amount .. " gold has been refunded.")
+            SafeRefund(wGuid, amountCopper, "duel interrupted", false)
+            SafeRefund(lGuid, amountCopper, "duel interrupted", false)
         end
-        
-        activeBets[winnerName] = nil
-        activeBets[loserName] = nil
     end
 end
 
+-- ==========================================
+-- 5. LOGOUT/CRASH RECOVERY 
+-- ==========================================
 local function OnPlayerLogout(event, player)
-    local playerName = player:GetName()
+    local guid = player:GetGUIDLow()
     
-    if pendingBets[playerName] then
-        pendingBets[playerName] = nil
-    end
-    
-    if activeBets[playerName] then
-        local opponentName = activeBets[playerName].opponent
-        local amount = activeBets[playerName].amount
-        
-        player:ModifyMoney(ToCopper(amount))
-        
-        local opponent = GetPlayerByName(opponentName)
-        if opponent then
-            opponent:ModifyMoney(ToCopper(amount))
-            SendMsg(opponent, playerName .. " has logged out. Your duel bet has been cancelled and refunded.")
-        else
-            CharDBExecute("UPDATE characters SET money = money + " .. ToCopper(amount) .. " WHERE name = '" .. opponentName .. "'")
-        end
-        
-        activeBets[playerName] = nil
-        activeBets[opponentName] = nil
+    local q = CharDBQuery("SELECT id, player1_guid, player2_guid, amount, status FROM duel_bets WHERE player1_guid = " .. guid .. " OR player2_guid = " .. guid)
+    if q then
+        repeat
+            local betId = q:GetUInt32(0)
+            local p1 = q:GetUInt32(1)
+            local p2 = q:GetUInt32(2)
+            local amount = q:GetUInt32(3)
+            local status = q:GetUInt8(4)
+
+            CharDBExecute("DELETE FROM duel_bets WHERE id = " .. betId)
+
+            if status == 0 then
+                -- true = We force return by mail for the one who leaves
+                SafeRefund(p1, amount, "player logged out", (p1 == guid))
+            elseif status >= 1 then
+                SafeRefund(p1, amount, "player logged out (abandoned)", (p1 == guid))
+                SafeRefund(p2, amount, "player logged out (abandoned)", (p2 == guid))
+            end
+        until not q:NextRow()
     end
 end
 
